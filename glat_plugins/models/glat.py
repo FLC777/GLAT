@@ -97,7 +97,8 @@ class Glat(FairseqNATModel):
         length_tgt = self.decoder.forward_length_prediction(
             length_out, encoder_out, tgt_tokens
         )
-
+        nonpad_positions = tgt_tokens.ne(self.pad)
+        seq_lens = (nonpad_positions).sum(1)
         rand_seed = random.randint(0, 19260817)
         # glancing sampling
         glat_info = None
@@ -110,9 +111,7 @@ class Glat(FairseqNATModel):
                         encoder_out=encoder_out,
                     )
                 pred_tokens = word_ins_out.argmax(-1)
-                nonpad_positions = tgt_tokens.ne(self.pad)
                 same_num = ((pred_tokens == tgt_tokens) & nonpad_positions).sum(1)
-                seq_lens = (nonpad_positions).sum(1)
                 input_mask = torch.ones_like(nonpad_positions)
                 bsz, seq_len = tgt_tokens.size()
                 for li in range(bsz):
@@ -149,7 +148,7 @@ class Glat(FairseqNATModel):
             "length": {
                 "out": length_out,
                 "tgt": length_tgt,
-                "factor": self.decoder.length_loss_factor,
+                "factor": self.decoder.length_loss_factor*(tgt_tokens.ne(self.pad).sum().item())/(seq_lens.sum().item()),
             }
         }
         if glat_info is not None:
