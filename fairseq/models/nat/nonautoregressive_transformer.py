@@ -227,7 +227,7 @@ class NATransformerDecoder(FairseqNATDecoder):
         self.pred_length_offset = getattr(args, "pred_length_offset", False)
         self.length_loss_factor = getattr(args, "length_loss_factor", 0.1)
         self.src_embedding_copy = getattr(args, "src_embedding_copy", False)
-        self.embed_length = Embedding(256, self.encoder_embed_dim, None)
+        self.embed_length = Embedding(getattr(args, "max_target_positions", 256), self.encoder_embed_dim, None)
         if self.src_embedding_copy:
             self.copy_attn = torch.nn.Linear(self.embed_dim, self.embed_dim, bias=False)
 
