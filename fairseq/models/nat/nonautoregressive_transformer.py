@@ -156,6 +156,8 @@ class NATransformerModel(FairseqNATModel):
             self.decoder.forward_length(normalize=True, encoder_out=encoder_out),
             encoder_out=encoder_out,
         )
+        if len(length_tgt.size()) == 0:
+            length_tgt = length_tgt.unsqueeze(0)
 
         max_length = length_tgt.clamp_(min=2).max()
         idx_length = utils.new_arange(src_tokens, max_length)
@@ -225,9 +227,11 @@ class NATransformerDecoder(FairseqNATDecoder):
         self.encoder_embed_dim = args.encoder_embed_dim
         self.sg_length_pred = getattr(args, "sg_length_pred", False)
         self.pred_length_offset = getattr(args, "pred_length_offset", False)
-        self.length_loss_factor = getattr(args, "length_loss_factor", 0.1)
+        self.length_loss_factor = getattr(args, "length_loss_factor", 1)
         self.src_embedding_copy = getattr(args, "src_embedding_copy", False)
-        self.embed_length = Embedding(getattr(args, "max_target_positions", 256), self.encoder_embed_dim, None)
+        if self.length_loss_factor>0:
+            self.embed_length = Embedding(getattr(args, "max_target_positions", 256), self.encoder_embed_dim, None)
+            torch.nn.init.normal_(self.embed_length.weight, mean=0, std=0.02)
         if self.src_embedding_copy:
             self.copy_attn = torch.nn.Linear(self.embed_dim, self.embed_dim, bias=False)
 
@@ -243,7 +247,8 @@ class NATransformerDecoder(FairseqNATDecoder):
 
     @ensemble_decoder
     def forward_length(self, normalize, encoder_out):
-        enc_feats = encoder_out["encoder_out"][0]  # T x B x C
+        # enc_feats = encoder_out["length_out"][0].squeeze(0)  # T x B x C
+        enc_feats = encoder_out["encoder_out"][0]
         if len(encoder_out["encoder_padding_mask"]) > 0:
             src_masks = encoder_out["encoder_padding_mask"][0]  # B x T
         else:
@@ -252,6 +257,7 @@ class NATransformerDecoder(FairseqNATDecoder):
         if self.sg_length_pred:
             enc_feats = enc_feats.detach()
         length_out = F.linear(enc_feats, self.embed_length.weight)
+        # length_out[:, 0] += float('-inf')
         return F.log_softmax(length_out, -1) if normalize else length_out
 
     def extract_features(
@@ -317,9 +323,9 @@ class NATransformerDecoder(FairseqNATDecoder):
             if (early_exit is not None) and (i >= early_exit):
                 break
 
-            if positions is not None:
+            if positions is not None and (i==0 or embedding_copy):
                 x += positions
-            x = self.dropout_module(x)
+                x = self.dropout_module(x)
 
             x, attn, _ = layer(
                 x,
@@ -349,7 +355,12 @@ class NATransformerDecoder(FairseqNATDecoder):
         return x, {"attn": attn, "inner_states": inner_states}
 
     def forward_embedding(self, prev_output_tokens, states=None):
-        # embed tokens
+        positions = (
+            self.embed_positions(prev_output_tokens)
+            if self.embed_positions is not None
+            else None
+        )
+        # embed tokens and positions
         if states is None:
             x = self.embed_tokens(prev_output_tokens)
             if self.project_in_dim is not None:
@@ -357,6 +368,9 @@ class NATransformerDecoder(FairseqNATDecoder):
         else:
             x = states
 
+        # if positions is not None:
+        #     x += positions
+        # x = self.dropout_module(x)
         decoder_padding_mask = prev_output_tokens.eq(self.padding_idx)
         return x, decoder_padding_mask
 
@@ -397,7 +411,7 @@ class NATransformerDecoder(FairseqNATDecoder):
                 length_tgt = tgt_lengs - src_lengs + 128
             else:
                 length_tgt = tgt_lengs
-            length_tgt = length_tgt.clamp(min=0, max=255)
+            length_tgt = length_tgt.clamp(min=0, max=1023)
 
         else:
             # predict the length target (greedy for now)
@@ -413,6 +427,8 @@ class NATransformerDecoder(FairseqNATDecoder):
 class NATransformerEncoder(FairseqNATEncoder):
     def __init__(self, args, dictionary, embed_tokens):
         super().__init__(args, dictionary, embed_tokens)
+        # self.len_embed = torch.nn.Parameter(torch.Tensor(1, args.encoder_embed_dim))
+        # torch.nn.init.normal_(self.len_embed, mean=0, std=0.02)
 
     @ensemble_encoder
     def forward(
@@ -432,6 +448,11 @@ class NATransformerEncoder(FairseqNATEncoder):
         if encoder_padding_mask is not None:
             x = x * (1 - encoder_padding_mask.unsqueeze(-1).type_as(x))
 
+        # x = torch.cat([self.len_embed.unsqueeze(0).repeat(src_tokens.size(0),1,1), x], dim=1)
+        x = self.dropout_module(x)
+        # if encoder_padding_mask is not None:
+        #     encoder_padding_mask = torch.cat(
+        #         [encoder_padding_mask.new(src_tokens.size(0), 1).fill_(0), encoder_padding_mask], dim=1)
         # B x T x C -> T x B x C
         x = x.transpose(0, 1)
 
@@ -450,7 +471,10 @@ class NATransformerEncoder(FairseqNATEncoder):
 
         if self.layer_norm is not None:
             x = self.layer_norm(x)
-
+        len_x = x[0, :, :]
+        # x = x[1:, :, :]
+        # if encoder_padding_mask is not None:
+        #     encoder_padding_mask = encoder_padding_mask[:, 1:]
         # The Pytorch Mobile lite interpreter does not supports returning NamedTuple in
         # `forward` so we use a dictionary instead.
         # TorchScript does not support mixed values so the values are all lists.
@@ -460,6 +484,7 @@ class NATransformerEncoder(FairseqNATEncoder):
             "encoder_padding_mask": [encoder_padding_mask],  # B x T
             "encoder_embedding": [encoder_embedding],  # B x T x C
             "encoder_pos": [encoder_pos],
+            "length_out": [len_x],
             "encoder_states": encoder_states,  # List[T x B x C]
             "src_tokens": [],
             "src_lengths": [],
@@ -476,7 +501,7 @@ class NATransformerEncoder(FairseqNATEncoder):
             x = embed + self.embed_positions(src_tokens)
         if self.layernorm_embedding is not None:
             x = self.layernorm_embedding(x)
-        x = self.dropout_module(x)
+        # x = self.dropout_module(x)
         if self.quant_noise is not None:
             x = self.quant_noise(x)
         return x, embed
@@ -497,6 +522,10 @@ class NATransformerEncoder(FairseqNATEncoder):
             new_encoder_out = []
         else:
             new_encoder_out = [encoder_out["encoder_out"][0].index_select(1, new_order)]
+        if len(encoder_out["length_out"]) == 0:
+            new_length_out = []
+        else:
+            new_length_out = [encoder_out["length_out"][0].index_select(1, new_order)]
         if len(encoder_out["encoder_padding_mask"]) == 0:
             new_encoder_padding_mask = []
         else:
@@ -536,6 +565,7 @@ class NATransformerEncoder(FairseqNATEncoder):
             "encoder_padding_mask": new_encoder_padding_mask,  # B x T
             "encoder_embedding": new_encoder_embedding,  # B x T x C
             "encoder_pos": new_encoder_pos,
+            "length_out": new_length_out,
             "encoder_states": encoder_states,  # List[T x B x C]
             "src_tokens": src_tokens,  # B x T
             "src_lengths": src_lengths,  # B x 1
@@ -564,6 +594,7 @@ def base_architecture(args):
     args.attention_dropout = getattr(args, "attention_dropout", 0.0)
     args.activation_dropout = getattr(args, "activation_dropout", 0.0)
     args.activation_fn = getattr(args, "activation_fn", "relu")
+    args.layer_norm = getattr(args, "layer_norm", "normal")
     args.dropout = getattr(args, "dropout", 0.1)
     args.adaptive_softmax_cutoff = getattr(args, "adaptive_softmax_cutoff", None)
     args.adaptive_softmax_dropout = getattr(args, "adaptive_softmax_dropout", 0)
