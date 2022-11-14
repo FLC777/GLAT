@@ -57,11 +57,19 @@ python3 train.py ${data_dir} --arch glat_ctc --noise full_mask --share-all-embed
 ```
 
 ### Inference
+* The default setting without self re-ranking
 ```
 checkpoint_path=path_to_your_checkpoint
 python3 fairseq_cli/generate.py ${data_dir} --path ${checkpoint_path} --user-dir glat_plugins \
     --task translation_lev_modified --remove-bpe --max-sentences 20 --source-lang ${src} --target-lang ${tgt} \
     --quiet --iter-decode-max-iter 0 --iter-decode-eos-penalty 0 --iter-decode-with-beam 1 --gen-subset test
+```
+* Generating with self re-ranking of beam 5
+```
+checkpoint_path=path_to_your_checkpoint
+python3 fairseq_cli/generate.py ${data_dir} --path ${checkpoint_path} --user-dir glat_plugins \
+    --task translation_lev_modified --remove-bpe --max-sentences 20 --source-lang ${src} --target-lang ${tgt} \
+    --quiet --iter-decode-max-iter 0 --iter-decode-eos-penalty 0 --iter-decode-with-beam 5 --gen-subset test
 ```
 The script for averaging checkpoints is scripts/average_checkpoints.py
 

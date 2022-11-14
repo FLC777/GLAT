@@ -19,7 +19,7 @@ class LabelSmoothedCTCCriterion(FairseqCriterion):
     def __init__(self, task, label_smoothing):
         super().__init__(task)
         self.label_smoothing = label_smoothing
-        self.blank_id = task.tgt_dict.pad()
+        self.blank_id = task.tgt_dict.unk()
         self.ctc_loss = torch.nn.CTCLoss(blank=self.blank_id, reduction='none', zero_infinity=True)
 
     @staticmethod

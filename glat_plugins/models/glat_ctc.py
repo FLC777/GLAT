@@ -11,10 +11,13 @@ from fairseq.models.nat import FairseqNATModel
 from fairseq.modules.transformer_sentence_encoder import init_bert_params
 import torch
 import torch.nn.functional as F
-from fairseq.models.nat.nonautoregressive_transformer import NATransformerEncoder, NATransformerDecoder, NATransformerModel
+from fairseq.models.nat.nonautoregressive_transformer import NATransformerEncoder, NATransformerDecoder, \
+    NATransformerModel
 import logging
 import random
 from contextlib import contextmanager
+from fairseq.models.imputer import best_alignment
+
 logger = logging.getLogger(__name__)
 
 
@@ -210,7 +213,7 @@ class GlatCTC(FairseqNATModel):
         cur_path[:, 0, 1] = target[:, 0]
         blank_target = torch.stack([torch.full_like(target, self.mask_idx), target], dim=-1).flatten(start_dim=-2)
         blank_target = torch.cat([blank_target, torch.full([bsz, 1], self.mask_idx).long().cuda()],
-                                dim=-1).unsqueeze(1)
+                                 dim=-1).unsqueeze(1)
         l_mask = torch.zeros([expand_len, bsz]).long().cuda()
         l_mask[label_ids - 2, :] = 1
         l_mask = l_mask.bool()
@@ -222,14 +225,15 @@ class GlatCTC(FairseqNATModel):
             choose_s1 = ctc_dp[i - 1][:expand_len].ge(blank_max)
             choose_s2[choose_s1 & l_mask] = 2
             label_max = torch.max(ctc_dp[i - 1][:expand_len], blank_max)
-            ctc_dp[i, label_ids] = label_max[label_ids - 2] + (target_lprob[i, :, target_range]).transpose(0,1)
+            ctc_dp[i, label_ids] = label_max[label_ids - 2] + (target_lprob[i, :, target_range]).transpose(0, 1)
             # get the path corresponding to the largest align score
             in_output = (output_lens > i).long().unsqueeze(0)
-            select_idx = expand_range - (choose_s2*in_output).long()
+            select_idx = expand_range - (choose_s2 * in_output).long()
             select_idx = select_idx.transpose(0, 1).unsqueeze(1).repeat(1, i, 1)
             previous_path = cur_path.gather(dim=-1, index=select_idx)
             cur_path = torch.cat([previous_path, blank_target], dim=1)
-        last_is_blank = ctc_dp[output_len - 1, 2 * target_lens + 2, bsz_range].ge(ctc_dp[output_len - 1, 2 * target_lens + 1, bsz_range])
+        last_is_blank = ctc_dp[output_len - 1, 2 * target_lens + 2, bsz_range].ge(
+            ctc_dp[output_len - 1, 2 * target_lens + 1, bsz_range])
         align_path = cur_path[bsz_range, :, last_is_blank.long() + 2 * target_lens - 1]
         return align_path
 
@@ -259,37 +263,37 @@ class GlatCTC(FairseqNATModel):
                         encoder_out=encoder_out,
                     )
                 pred_tokens = word_ins_out.argmax(-1)
+                out_lprobs = F.log_softmax(word_ins_out, dim=-1, dtype=torch.float32)
+                best_aligns = best_alignment(out_lprobs.transpose(0, 1), target, seq_lens, target_lens, self.mask_idx,
+                                             zero_infinity=True)
+                best_aligns_pad = torch.tensor([a + [0] * (word_ins_out.shape[1] - len(a)) for a in best_aligns],
+                                               device=word_ins_out.device, dtype=target.dtype)
+                oracle_pos = (best_aligns_pad // 2).clip(max=target.shape[1] - 1)
 
-                # best_aligns = best_alignment(logits_T, target, seq_lens, target_lens, self.mask_idx, zero_infinity=True)
-                # best_aligns_pad = torch.tensor([a + [0] * (logits.shape[1] - len(a)) for a in best_aligns],
-                #                                device=logits.device, dtype=target.dtype)
-                # oracle_pos = (best_aligns_pad // 2).clip(max=target.shape[1] - 1)
-                #
-                # oracle = target.gather(-1, oracle_pos)
-                # oracle_empty = oracle.masked_fill(best_aligns_pad % 2 == 0, self.mask_idx)
-                # v_path = oracle_empty
+                oracle = target.gather(-1, oracle_pos)
+                oracle_empty = oracle.masked_fill(best_aligns_pad % 2 == 0, self.mask_idx)
 
-                # same_num = ((pred_tokens == oracle_empty) & (~decoder_padding_mask)).sum(1)
-                # keep_prob = ((seq_lens - same_num) / seq_lens * glat['context_p']).unsqueeze(-1)
-                # # keep: True, drop: False
-                # keep_word_mask = (torch.rand(prev_output_tokens.shape, device=word_ins_out.device) < keep_prob).bool()
-                #
-                # glat_prev_output_tokens = prev_output_tokens.masked_fill(keep_word_mask, 0) + oracle.masked_fill(
-                #     ~keep_word_mask, 0)
-                # glat_tgt_tokens = oracle.masked_fill(keep_word_mask, self.pad)
-                align_path = self.get_align_target(word_ins_out, target, seq_lens)
+                same_num = ((pred_tokens == oracle_empty) & (~decoder_padding_mask)).sum(1)
+                keep_prob = ((seq_lens - same_num) / seq_lens * glat['context_p']).unsqueeze(-1)
+                # keep: True, drop: False
+                keep_word_mask = (torch.rand(prev_output_tokens.shape, device=word_ins_out.device) < keep_prob).bool()
 
-                same_target = pred_tokens.eq(align_path)
-                same_target = same_target.masked_fill(decoder_padding_mask, False)
-                same_num = same_target.sum(-1)
-                input_mask = torch.ones_like(prev_output_tokens)
-                for li in range(bsz):
-                    target_num = (((seq_lens[li] - same_num[li]).float()) * glat['context_p']).long()
-                    if target_num > 0:
-                        input_mask[li].scatter_(dim=0, index=torch.randperm(seq_lens[li])[:target_num].cuda(), value=0)
-                input_mask = input_mask.eq(1)
-                input_mask = input_mask.masked_fill(decoder_padding_mask,False)
-                glat_prev_output_tokens = prev_output_tokens.masked_fill(~input_mask, 0) + align_path.masked_fill(input_mask, 0)
+                glat_prev_output_tokens = prev_output_tokens.masked_fill(keep_word_mask, 0) + oracle.masked_fill(
+                    ~keep_word_mask, 0)
+                glat_tgt_tokens = oracle.masked_fill(keep_word_mask, self.pad)
+                # align_path = self.get_align_target(word_ins_out, target, seq_lens)
+                # align_path = align_path.masked_fill(decoder_padding_mask, self.pad)
+                # same_target = pred_tokens.eq(align_path)
+                # same_target = same_target.masked_fill(decoder_padding_mask, False)
+                # same_num = same_target.sum(-1)
+                # input_mask = torch.ones_like(prev_output_tokens)
+                # for li in range(bsz):
+                #     target_num = (((seq_lens[li] - same_num[li]).float()) * glat['context_p']).long()
+                #     if target_num > 0:
+                #         input_mask[li].scatter_(dim=0, index=torch.randperm(seq_lens[li])[:target_num].cuda(), value=0)
+                # input_mask = input_mask.eq(1)
+                # input_mask = input_mask.masked_fill(decoder_padding_mask,False)
+                # glat_prev_output_tokens = prev_output_tokens.masked_fill(~input_mask, 0) + align_path.masked_fill(input_mask, 0)
 
                 prev_output_tokens = glat_prev_output_tokens
 
@@ -372,14 +376,15 @@ def base_architecture(args):
 def glat_architecture(args):
     args.encoder_layers = getattr(args, "encoder_layers", 6)
     args.encoder_embed_dim = getattr(args, "encoder_embed_dim", 512)
-    args.encoder_ffn_embed_dim = getattr(args, "encoder_ffn_embed_dim", args.encoder_embed_dim*4)
-    args.encoder_attention_heads = getattr(args, "encoder_attention_heads", args.encoder_embed_dim//64)
+    args.encoder_ffn_embed_dim = getattr(args, "encoder_ffn_embed_dim", args.encoder_embed_dim * 4)
+    args.encoder_attention_heads = getattr(args, "encoder_attention_heads", args.encoder_embed_dim // 64)
 
     args.decoder_layers = getattr(args, "decoder_layers", 6)
     args.decoder_embed_dim = getattr(args, "decoder_embed_dim", 512)
-    args.decoder_ffn_embed_dim = getattr(args, "decoder_ffn_embed_dim", args.decoder_embed_dim*4)
-    args.decoder_attention_heads = getattr(args, "decoder_attention_heads", args.decoder_embed_dim//64)
+    args.decoder_ffn_embed_dim = getattr(args, "decoder_ffn_embed_dim", args.decoder_embed_dim * 4)
+    args.decoder_attention_heads = getattr(args, "decoder_attention_heads", args.decoder_embed_dim // 64)
     base_architecture(args)
+
 
 @register_model_architecture(
     "glat_ctc", "glat_ctc_base"

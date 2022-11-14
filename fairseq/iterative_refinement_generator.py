@@ -299,7 +299,7 @@ class IterativeRefinementGenerator(object):
                 finalized[
                     np.argmax(
                         [
-                            finalized[self.beam_size * i + j][0]["score"]
+                            finalized[self.beam_size * i + j][0]["score"].item()
                             for j in range(self.beam_size)
                         ]
                     )
