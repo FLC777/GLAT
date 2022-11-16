@@ -16,7 +16,7 @@ from fairseq.models.nat.nonautoregressive_transformer import NATransformerEncode
 import logging
 import random
 from contextlib import contextmanager
-from fairseq.models.imputer import best_alignment
+from torch_imputer.imputer import best_alignment
 
 logger = logging.getLogger(__name__)
 
